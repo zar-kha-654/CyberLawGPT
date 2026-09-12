@@ -1,329 +1,709 @@
+```python
 import os
+import re
 import io
+import requests
 import numpy as np
 import streamlit as st
 import faiss
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from groq import Groq
+from openai import OpenAI
 
-# -----------------------------
-# Configuration
-# -----------------------------
+
+# ============================================================
+# CyerLawGPT
+# Pakistan Cyber Law RAG Application
+# ============================================================
+
 st.set_page_config(
-    page_title="PDF Chat with FAISS",
-    page_icon="📚",
-    layout="wide",
+    page_title="CyerLawGPT",
+    page_icon="⚖️",
+    layout="wide"
 )
 
-GROQ_MODEL = "openai/gpt-oss-120b"
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Keep chunks small enough for the embedding model.
-CHUNK_TOKENS = 200
-CHUNK_OVERLAP = 40
-TOP_K = 5
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
+DEFAULT_DOC_URL = (
+    "https://docs.google.com/document/d/"
+    "1YwgWc8Olvd5d5PXbnJUcNhalSItxQsUd68imK5EdY-g"
+    "/edit?usp=sharing"
+)
 
-# -----------------------------
-# Cached models
-# -----------------------------
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL)
+DEFAULT_MODEL = "grok-4.6"
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-
-@st.cache_resource
-def load_groq_client():
-    api_key = None
-
-    # Streamlit Cloud / local .streamlit/secrets.toml
-    try:
-        api_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
-        pass
-
-    # Optional local environment variable
-    api_key = api_key or os.getenv("GROQ_API_KEY")
-
-    if not api_key:
-        return None
-
-    return Groq(api_key=api_key)
+CHUNK_SIZE = 180
+CHUNK_OVERLAP = 35
 
 
-# -----------------------------
-# PDF extraction
-# -----------------------------
-def extract_pdf_text(pdf_bytes: bytes):
-    reader = PdfReader(io.BytesIO(pdf_bytes))
+# ============================================================
+# PAGE TITLE
+# ============================================================
+
+st.title("⚖️ CyerLawGPT")
+
+st.markdown(
+    """
+    **Pakistan Cyber Law AI Assistant**
+
+    Ask questions about Pakistan's cybercrime law using the supplied
+    legal document as the primary source.
+    """
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header("⚙️ Settings")
+
+    api_key = st.text_input(
+        "Grok / xAI API Key",
+        value=os.getenv("XAI_API_KEY", ""),
+        type="password",
+        help="Enter your xAI API key."
+    )
+
+    model_name = st.text_input(
+        "Grok Model",
+        value=os.getenv("XAI_MODEL", DEFAULT_MODEL)
+    )
+
+    technical_level = st.selectbox(
+        "Technical / Legal Level",
+        [
+            "Beginner",
+            "Intermediate",
+            "Technical",
+            "Legal-professional"
+        ]
+    )
+
+    response_size = st.selectbox(
+        "Response Size",
+        [
+            "Short",
+            "Medium",
+            "Detailed",
+            "Very detailed"
+        ]
+    )
+
+    language = st.selectbox(
+        "Response Language",
+        [
+            "English",
+            "Urdu",
+            "Roman Urdu"
+        ]
+    )
+
+    grounding = st.selectbox(
+        "Legal Grounding",
+        [
+            "Balanced",
+            "Strictly source-grounded",
+            "Maximum strictness"
+        ]
+    )
+
+    top_k = st.slider(
+        "Retrieved Passages",
+        min_value=3,
+        max_value=10,
+        value=5
+    )
+
+    show_sources = st.checkbox(
+        "Show retrieved legal passages",
+        value=False
+    )
+
+    st.divider()
+
+    st.caption(
+        "⚠️ This tool provides educational information and is "
+        "not a substitute for advice from a qualified lawyer."
+    )
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def extract_google_doc_id(url):
+    """
+    Extract Google Docs document ID.
+    """
+
+    match = re.search(
+        r"/document/d/([a-zA-Z0-9_-]+)",
+        url
+    )
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def get_pdf_url():
+
+    custom_pdf = os.getenv("CYBER_LAW_PDF_URL", "").strip()
+
+    if custom_pdf:
+        return custom_pdf
+
+    doc_url = os.getenv(
+        "CYBER_LAW_DOC_URL",
+        DEFAULT_DOC_URL
+    )
+
+    doc_id = extract_google_doc_id(doc_url)
+
+    if doc_id:
+        return (
+            f"https://docs.google.com/document/d/"
+            f"{doc_id}/export?format=pdf"
+        )
+
+    return doc_url
+
+
+@st.cache_data(show_spinner=False)
+def download_pdf():
+
+    pdf_url = get_pdf_url()
+
+    response = requests.get(
+        pdf_url,
+        timeout=60
+    )
+
+    response.raise_for_status()
+
+    content_type = response.headers.get(
+        "content-type",
+        ""
+    ).lower()
+
+    if (
+        "pdf" not in content_type
+        and not response.content.startswith(b"%PDF")
+    ):
+        raise ValueError(
+            "The supplied document URL did not return a PDF. "
+            "Check CYBER_LAW_DOC_URL or CYBER_LAW_PDF_URL."
+        )
+
+    return response.content
+
+
+@st.cache_data(show_spinner=False)
+def extract_pdf_text(pdf_bytes):
+
+    reader = PdfReader(
+        io.BytesIO(pdf_bytes)
+    )
+
     pages = []
 
     for page_number, page in enumerate(reader.pages, start=1):
+
         text = page.extract_text() or ""
-        text = " ".join(text.split())
+
+        text = text.replace(
+            "\x00",
+            " "
+        )
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text
+        ).strip()
 
         if text:
             pages.append(
                 {
                     "page": page_number,
-                    "text": text,
+                    "text": text
                 }
             )
 
     return pages
 
 
-# -----------------------------
-# Token-based chunking
-# -----------------------------
-def chunk_pages(pages, tokenizer):
+def create_chunks(pages):
+
     chunks = []
 
     for page in pages:
-        text = page["text"]
 
-        # Tokenize without truncating.
-        token_ids = tokenizer.encode(
-            text,
-            add_special_tokens=False,
-            truncation=False,
-        )
+        words = page["text"].split()
+
+        if not words:
+            continue
 
         start = 0
 
-        while start < len(token_ids):
-            end = min(start + CHUNK_TOKENS, len(token_ids))
-            chunk_ids = token_ids[start:end]
+        while start < len(words):
 
-            chunk_text = tokenizer.decode(
-                chunk_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True,
-            ).strip()
+            end = min(
+                start + CHUNK_SIZE,
+                len(words)
+            )
 
-            if chunk_text:
-                chunks.append(
-                    {
-                        "text": chunk_text,
-                        "page": page["page"],
-                        "chunk_id": len(chunks),
-                    }
-                )
+            chunk_text = " ".join(
+                words[start:end]
+            )
 
-            if end >= len(token_ids):
+            chunks.append(
+                {
+                    "page": page["page"],
+                    "text": chunk_text
+                }
+            )
+
+            if end >= len(words):
                 break
 
-            start = end - CHUNK_OVERLAP
+            start = max(
+                end - CHUNK_OVERLAP,
+                start + 1
+            )
 
     return chunks
 
 
-# -----------------------------
-# FAISS index
-# -----------------------------
-def create_faiss_index(chunks, embedding_model):
-    texts = [chunk["text"] for chunk in chunks]
+@st.cache_resource(show_spinner=False)
+def load_embedding_model():
 
-    embeddings = embedding_model.encode(
+    model_name = os.getenv(
+        "EMBEDDING_MODEL",
+        DEFAULT_EMBEDDING_MODEL
+    )
+
+    return SentenceTransformer(
+        model_name
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def build_faiss_index():
+
+    pdf_bytes = download_pdf()
+
+    pages = extract_pdf_text(
+        pdf_bytes
+    )
+
+    chunks = create_chunks(
+        pages
+    )
+
+    if not chunks:
+        raise ValueError(
+            "No readable text was found in the PDF."
+        )
+
+    model = load_embedding_model()
+
+    texts = [
+        chunk["text"]
+        for chunk in chunks
+    ]
+
+    embeddings = model.encode(
         texts,
         convert_to_numpy=True,
         normalize_embeddings=True,
-        show_progress_bar=False,
-    ).astype("float32")
+        show_progress_bar=False
+    )
 
-    # With normalized vectors, inner product == cosine similarity.
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
+    embeddings = np.asarray(
+        embeddings,
+        dtype="float32"
+    )
 
-    return index, embeddings
+    index = faiss.IndexFlatIP(
+        embeddings.shape[1]
+    )
+
+    index.add(
+        embeddings
+    )
+
+    return index, chunks
 
 
-def search_faiss(query, index, chunks, embedding_model, top_k=TOP_K):
-    query_embedding = embedding_model.encode(
-        [query],
+def retrieve_context(
+    question,
+    index,
+    chunks,
+    model,
+    top_k
+):
+
+    question_embedding = model.encode(
+        [question],
         convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    ).astype("float32")
+        normalize_embeddings=True
+    )
 
-    k = min(top_k, index.ntotal)
+    question_embedding = np.asarray(
+        question_embedding,
+        dtype="float32"
+    )
 
-    scores, indices = index.search(query_embedding, k)
+    scores, indices = index.search(
+        question_embedding,
+        min(top_k, len(chunks))
+    )
 
     results = []
 
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
+    for score, idx in zip(
+        scores[0],
+        indices[0]
+    ):
+
+        if idx < 0:
             continue
 
-        result = dict(chunks[idx])
-        result["score"] = float(score)
-        results.append(result)
+        results.append(
+            {
+                "page": chunks[idx]["page"],
+                "text": chunks[idx]["text"],
+                "score": float(score)
+            }
+        )
 
     return results
 
 
-# -----------------------------
-# Groq answer generation
-# -----------------------------
-def generate_answer(question, search_results, groq_client):
-    context_parts = []
+def build_system_prompt():
 
-    for result in search_results:
-        context_parts.append(
-            f"[Page {result['page']}]\n{result['text']}"
+    if grounding == "Maximum strictness":
+
+        grounding_instruction = """
+        Use ONLY information supported by the retrieved legal passages.
+
+        Do not infer missing legal provisions.
+
+        If the retrieved material does not answer the question,
+        explicitly say that the supplied document does not contain
+        enough information to answer it reliably.
+        """
+
+    elif grounding == "Strictly source-grounded":
+
+        grounding_instruction = """
+        Base legal claims primarily on the retrieved passages.
+
+        Do not invent section numbers, punishments, definitions,
+        procedures, authorities, or legal requirements.
+        """
+
+    else:
+
+        grounding_instruction = """
+        Use the retrieved legal passages as the primary source.
+        General explanation may be used only when it does not
+        contradict the supplied legal material.
+        """
+
+    return f"""
+You are CyerLawGPT, an AI assistant specializing in Pakistan
+cyber law and the Prevention of Electronic Crimes Act (PECA).
+
+Your job is to explain the supplied legal document clearly.
+
+IMPORTANT RULES:
+
+1. Treat the supplied legal document as the primary legal source.
+
+2. {grounding_instruction}
+
+3. Never fabricate:
+   - section numbers
+   - legal provisions
+   - punishments
+   - fines
+   - imprisonment terms
+   - authorities
+   - procedures
+   - definitions
+
+4. When possible, mention the relevant section number.
+
+5. Clearly distinguish between:
+   - what the Act/document says
+   - your plain-language explanation
+
+6. If the document does not provide enough information,
+   say so instead of guessing.
+
+7. Do not claim to be a lawyer.
+
+8. Do not provide instructions for committing,
+   concealing, evading detection of, or optimizing cybercrime.
+
+9. Answer at the requested level:
+   {technical_level}
+
+10. Response length:
+   {response_size}
+
+11. Response language:
+   {language}
+
+Keep explanations accurate, clear, and useful.
+"""
+
+
+def ask_grok(
+    question,
+    context
+):
+
+    if not api_key:
+
+        raise ValueError(
+            "Please enter your Grok / xAI API key in the sidebar."
         )
 
-    context = "\n\n".join(context_parts)
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.x.ai/v1"
+    )
 
-    system_prompt = """You are a PDF question-answering assistant.
+    context_text = "\n\n".join(
+        [
+            (
+                f"[PDF Page {item['page']}]\n"
+                f"{item['text']}"
+            )
+            for item in context
+        ]
+    )
 
-Answer the user's question using ONLY the provided PDF context.
-If the answer is not present in the context, say:
-"I couldn't find that information in the uploaded PDF."
+    messages = [
+        {
+            "role": "system",
+            "content": build_system_prompt()
+        },
+        {
+            "role": "user",
+            "content": f"""
+LEGAL DOCUMENT PASSAGES:
 
-Do not invent facts.
-When possible, mention the page number(s) supporting the answer.
-Keep the answer clear and reasonably concise.
-"""
+{context_text}
 
-    user_prompt = f"""PDF CONTEXT:
+--------------------------------------------------
 
-{context}
+USER QUESTION:
 
-QUESTION:
 {question}
-"""
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=1000,
+--------------------------------------------------
+
+Answer the user's question using the legal passages above.
+"""
+        }
+    ]
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.2
     )
 
     return response.choices[0].message.content
 
 
-# -----------------------------
-# UI
-# -----------------------------
-st.title("📚 PDF Chat — FAISS + Open-Source Embeddings + Groq")
-st.caption(
-    "Upload a PDF → extract text → tokenize → chunk → embed → index with FAISS → ask questions."
-)
+# ============================================================
+# LOAD LEGAL DOCUMENT
+# ============================================================
 
-with st.sidebar:
-    st.header("Settings")
-    st.write(f"**LLM:** `{GROQ_MODEL}`")
-    st.write(f"**Embedding model:** `{EMBEDDING_MODEL}`")
-    st.write(f"**Chunk size:** `{CHUNK_TOKENS}` tokens")
-    st.write(f"**Chunk overlap:** `{CHUNK_OVERLAP}` tokens")
-    st.write(f"**Retrieved chunks:** `{TOP_K}`")
+try:
 
-groq_client = load_groq_client()
+    with st.spinner(
+        "📚 Downloading legal document and building FAISS index..."
+    ):
 
-if groq_client is None:
-    st.warning(
-        "GROQ_API_KEY is not configured. Add it to Streamlit Secrets before asking questions."
+        index, chunks = build_faiss_index()
+
+        embedding_model = load_embedding_model()
+
+    st.success(
+        f"✅ Legal knowledge base ready — {len(chunks)} passages indexed."
     )
 
-uploaded_file = st.file_uploader(
-    "Upload a PDF",
-    type=["pdf"],
-    help="For the first version, use text-based PDFs. Scanned/image-only PDFs need OCR.",
-)
+except Exception as e:
 
-if uploaded_file:
-    if st.session_state.get("file_name") != uploaded_file.name:
-        # New PDF: rebuild the in-memory index.
-        st.session_state.pop("index", None)
-        st.session_state.pop("chunks", None)
-        st.session_state.pop("file_name", None)
-
-    if "index" not in st.session_state:
-        with st.spinner("Loading embedding model..."):
-            embedding_model = load_embedding_model()
-
-        with st.spinner("Extracting PDF text..."):
-            pdf_bytes = uploaded_file.getvalue()
-            pages = extract_pdf_text(pdf_bytes)
-
-        if not pages:
-            st.error(
-                "No selectable text was found. This may be a scanned PDF. "
-                "OCR support can be added as a next step."
-            )
-            st.stop()
-
-        with st.spinner("Tokenizing and creating chunks..."):
-            tokenizer = embedding_model.tokenizer
-            chunks = chunk_pages(pages, tokenizer)
-
-        if not chunks:
-            st.error("No usable text chunks were created.")
-            st.stop()
-
-        with st.spinner("Creating embeddings and FAISS index..."):
-            index, _ = create_faiss_index(chunks, embedding_model)
-
-        st.session_state["index"] = index
-        st.session_state["chunks"] = chunks
-        st.session_state["file_name"] = uploaded_file.name
-
-        st.success(
-            f"Processed **{uploaded_file.name}**: "
-            f"{len(pages)} pages → {len(chunks)} chunks → FAISS index created."
-        )
-
-    else:
-        st.success(
-            f"Ready: **{st.session_state['file_name']}** "
-            f"({len(st.session_state['chunks'])} chunks indexed)"
-        )
-
-    question = st.text_input(
-        "Ask a question about the PDF",
-        placeholder="e.g. What are the main conclusions?",
+    st.error(
+        "❌ Could not load the legal document."
     )
 
-    if st.button("Ask", type="primary", disabled=not question.strip()):
-        if groq_client is None:
-            st.error("Configure GROQ_API_KEY first.")
-            st.stop()
+    st.code(
+        str(e)
+    )
 
-        with st.spinner("Searching the PDF..."):
-            embedding_model = load_embedding_model()
+    st.info(
+        "Check your Google Docs URL or set CYBER_LAW_PDF_URL "
+        "to a direct PDF URL."
+    )
 
-            results = search_faiss(
-                question,
-                st.session_state["index"],
-                st.session_state["chunks"],
-                embedding_model,
-                TOP_K,
-            )
+    st.stop()
 
-        with st.spinner("Generating answer..."):
-            answer = generate_answer(
-                question,
-                results,
-                groq_client,
-            )
 
-        st.subheader("Answer")
-        st.write(answer)
+# ============================================================
+# CHAT HISTORY
+# ============================================================
 
-        with st.expander("Retrieved PDF chunks"):
-            for i, result in enumerate(results, start=1):
-                st.markdown(
-                    f"**{i}. Page {result['page']} — similarity {result['score']:.3f}**"
+if "messages" not in st.session_state:
+
+    st.session_state.messages = []
+
+
+for message in st.session_state.messages:
+
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
+        )
+
+
+# ============================================================
+# USER QUESTION
+# ============================================================
+
+question = st.chat_input(
+    "Ask a question about Pakistan cyber law..."
+)
+
+
+if question:
+
+    # Display user question
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": question
+        }
+    )
+
+    with st.chat_message("user"):
+
+        st.markdown(
+            question
+        )
+
+    # Retrieve relevant passages
+    with st.spinner(
+        "🔎 Searching the legal document..."
+    ):
+
+        retrieved = retrieve_context(
+            question,
+            index,
+            chunks,
+            embedding_model,
+            top_k
+        )
+
+    # Generate answer
+    with st.chat_message("assistant"):
+
+        try:
+
+            with st.spinner(
+                "🤖 Asking Grok..."
+            ):
+
+                answer = ask_grok(
+                    question,
+                    retrieved
                 )
-                st.write(result["text"])
 
-else:
-    st.info("Upload a PDF to begin.")
+            st.markdown(
+                answer
+            )
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer
+                }
+            )
+
+        except Exception as e:
+
+            answer = (
+                "I could not generate an answer. "
+                "Please check your Grok/xAI API key and model."
+            )
+
+            st.error(
+                answer
+            )
+
+            st.code(
+                str(e)
+            )
+
+
+# ============================================================
+# SHOW SOURCES
+# ============================================================
+
+if question and show_sources:
+
+    st.divider()
+
+    st.subheader(
+        "📄 Retrieved Legal Passages"
+    )
+
+    for i, item in enumerate(
+        retrieved,
+        start=1
+    ):
+
+        with st.expander(
+            f"Passage {i} — PDF Page {item['page']} "
+            f"— Similarity {item['score']:.3f}"
+        ):
+
+            st.write(
+                item["text"]
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "CyerLawGPT • RAG + FAISS + Sentence Transformers + Grok/xAI"
+)
+
+st.caption(
+    "⚠️ For educational/informational purposes only. "
+    "This application does not constitute legal advice."
+)
+```
