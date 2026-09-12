@@ -9,11 +9,11 @@ import faiss
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from openai import OpenAI
+from groq import Groq
 
 
 # ============================================================
-# CyerLawGPT
+# CYERLAWGPT
 # Pakistan Cyber Law RAG Application
 # ============================================================
 
@@ -34,7 +34,7 @@ DEFAULT_DOC_URL = (
     "/edit?usp=sharing"
 )
 
-DEFAULT_MODEL = "grok-4.6"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 CHUNK_SIZE = 180
@@ -42,16 +42,16 @@ CHUNK_OVERLAP = 35
 
 
 # ============================================================
-# PAGE TITLE
+# TITLE
 # ============================================================
 
 st.title("⚖️ CyerLawGPT")
 
 st.markdown(
     """
-    **Pakistan Cyber Law AI Assistant**
+    ### Pakistan Cyber Law AI Assistant
 
-    Ask questions about Pakistan's cybercrime law using the supplied
+    Ask questions about Pakistan's cyber law using the supplied
     legal document as the primary source.
     """
 )
@@ -66,19 +66,22 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     api_key = st.text_input(
-        "Grok / xAI API Key",
-        value=os.getenv("XAI_API_KEY", ""),
+        "Groq API Key",
+        value=os.getenv("GROQ_API_KEY", ""),
         type="password",
-        help="Enter your xAI API key."
+        help="Enter your Groq API key."
     )
 
-    model_name = st.text_input(
-        "Grok Model",
-        value=os.getenv("XAI_MODEL", DEFAULT_MODEL)
+    model_name = st.selectbox(
+        "AI Model",
+        [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant"
+        ]
     )
 
     technical_level = st.selectbox(
-        "Technical / Legal Level",
+        "Answer Level",
         [
             "Beginner",
             "Intermediate",
@@ -129,20 +132,17 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption(
-        "⚠️ This tool provides educational information and is "
-        "not a substitute for advice from a qualified lawyer."
+    st.warning(
+        "This application provides educational information "
+        "and is not a substitute for advice from a qualified lawyer."
     )
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# GOOGLE DOC ID
 # ============================================================
 
 def extract_google_doc_id(url):
-    """
-    Extract Google Docs document ID.
-    """
 
     match = re.search(
         r"/document/d/([a-zA-Z0-9_-]+)",
@@ -155,9 +155,16 @@ def extract_google_doc_id(url):
     return None
 
 
+# ============================================================
+# GET PDF URL
+# ============================================================
+
 def get_pdf_url():
 
-    custom_pdf = os.getenv("CYBER_LAW_PDF_URL", "").strip()
+    custom_pdf = os.getenv(
+        "CYBER_LAW_PDF_URL",
+        ""
+    ).strip()
 
     if custom_pdf:
         return custom_pdf
@@ -167,16 +174,24 @@ def get_pdf_url():
         DEFAULT_DOC_URL
     )
 
-    doc_id = extract_google_doc_id(doc_url)
+    doc_id = extract_google_doc_id(
+        doc_url
+    )
 
     if doc_id:
+
         return (
-            f"https://docs.google.com/document/d/"
-            f"{doc_id}/export?format=pdf"
+            "https://docs.google.com/document/d/"
+            + doc_id
+            + "/export?format=pdf"
         )
 
     return doc_url
 
+
+# ============================================================
+# DOWNLOAD PDF
+# ============================================================
 
 @st.cache_data(show_spinner=False)
 def download_pdf():
@@ -190,22 +205,19 @@ def download_pdf():
 
     response.raise_for_status()
 
-    content_type = response.headers.get(
-        "content-type",
-        ""
-    ).lower()
+    if not response.content.startswith(b"%PDF"):
 
-    if (
-        "pdf" not in content_type
-        and not response.content.startswith(b"%PDF")
-    ):
         raise ValueError(
-            "The supplied document URL did not return a PDF. "
-            "Check CYBER_LAW_DOC_URL or CYBER_LAW_PDF_URL."
+            "The supplied document URL did not return a valid PDF. "
+            "Make sure the Google Doc is publicly accessible."
         )
 
     return response.content
 
+
+# ============================================================
+# EXTRACT PDF TEXT
+# ============================================================
 
 @st.cache_data(show_spinner=False)
 def extract_pdf_text(pdf_bytes):
@@ -216,7 +228,10 @@ def extract_pdf_text(pdf_bytes):
 
     pages = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
 
         text = page.extract_text() or ""
 
@@ -232,6 +247,7 @@ def extract_pdf_text(pdf_bytes):
         ).strip()
 
         if text:
+
             pages.append(
                 {
                     "page": page_number,
@@ -241,6 +257,10 @@ def extract_pdf_text(pdf_bytes):
 
     return pages
 
+
+# ============================================================
+# CREATE CHUNKS
+# ============================================================
 
 def create_chunks(pages):
 
@@ -284,6 +304,10 @@ def create_chunks(pages):
     return chunks
 
 
+# ============================================================
+# LOAD EMBEDDING MODEL
+# ============================================================
+
 @st.cache_resource(show_spinner=False)
 def load_embedding_model():
 
@@ -296,6 +320,10 @@ def load_embedding_model():
         model_name
     )
 
+
+# ============================================================
+# BUILD FAISS INDEX
+# ============================================================
 
 @st.cache_resource(show_spinner=False)
 def build_faiss_index():
@@ -311,6 +339,7 @@ def build_faiss_index():
     )
 
     if not chunks:
+
         raise ValueError(
             "No readable text was found in the PDF."
         )
@@ -344,6 +373,10 @@ def build_faiss_index():
 
     return index, chunks
 
+
+# ============================================================
+# RETRIEVE RELEVANT PASSAGES
+# ============================================================
 
 def retrieve_context(
     question,
@@ -390,87 +423,100 @@ def retrieve_context(
     return results
 
 
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
+
 def build_system_prompt():
 
     if grounding == "Maximum strictness":
 
         grounding_instruction = """
-        Use ONLY information supported by the retrieved legal passages.
+Use ONLY information supported by the retrieved legal passages.
 
-        Do not infer missing legal provisions.
+If the retrieved passages do not contain enough information,
+clearly say that the supplied document does not contain
+enough information to answer the question reliably.
 
-        If the retrieved material does not answer the question,
-        explicitly say that the supplied document does not contain
-        enough information to answer it reliably.
-        """
+Never guess.
+"""
 
     elif grounding == "Strictly source-grounded":
 
         grounding_instruction = """
-        Base legal claims primarily on the retrieved passages.
+Base legal claims primarily on the retrieved legal passages.
 
-        Do not invent section numbers, punishments, definitions,
-        procedures, authorities, or legal requirements.
-        """
+Do not invent section numbers, punishments, fines,
+definitions, authorities, or procedures.
+"""
 
     else:
 
         grounding_instruction = """
-        Use the retrieved legal passages as the primary source.
-        General explanation may be used only when it does not
-        contradict the supplied legal material.
-        """
+Use the retrieved legal passages as the primary source.
+You may explain the material in simple language, but
+do not contradict the supplied legal document.
+"""
 
     return f"""
-You are CyerLawGPT, an AI assistant specializing in Pakistan
-cyber law and the Prevention of Electronic Crimes Act (PECA).
+You are CyerLawGPT, an AI assistant specializing in
+Pakistan cyber law.
 
-Your job is to explain the supplied legal document clearly.
+Your primary task is to explain the supplied legal document,
+including the Prevention of Electronic Crimes Act (PECA),
+in an accurate and understandable way.
 
 IMPORTANT RULES:
 
-1. Treat the supplied legal document as the primary legal source.
+{grounding_instruction}
 
-2. {grounding_instruction}
+Never fabricate:
 
-3. Never fabricate:
-   - section numbers
-   - legal provisions
-   - punishments
-   - fines
-   - imprisonment terms
-   - authorities
-   - procedures
-   - definitions
+- Section numbers
+- Punishments
+- Fines
+- Imprisonment terms
+- Definitions
+- Legal procedures
+- Authorities
+- Legal requirements
 
-4. When possible, mention the relevant section number.
+When possible, mention the relevant section number.
 
-5. Clearly distinguish between:
-   - what the Act/document says
-   - your plain-language explanation
+Clearly distinguish between:
 
-6. If the document does not provide enough information,
-   say so instead of guessing.
+1. What the law/document says.
+2. Your plain-language explanation.
 
-7. Do not claim to be a lawyer.
+If the document does not contain enough information,
+say so instead of guessing.
 
-8. Do not provide instructions for committing,
-   concealing, evading detection of, or optimizing cybercrime.
+Do not claim to be a lawyer.
 
-9. Answer at the requested level:
-   {technical_level}
+Do not provide instructions for committing,
+concealing, evading detection of, or optimizing cybercrime.
 
-10. Response length:
-   {response_size}
+Answer according to this level:
 
-11. Response language:
-   {language}
+{technical_level}
 
-Keep explanations accurate, clear, and useful.
+Use this response length:
+
+{response_size}
+
+Use this language:
+
+{language}
+
+Be accurate, clear, and helpful.
 """
 
 
-def ask_grok(
+# ============================================================
+# ASK GROQ
+# ============================================================
+
+def ask_groq(
     question,
     context
 ):
@@ -478,20 +524,16 @@ def ask_grok(
     if not api_key:
 
         raise ValueError(
-            "Please enter your Grok / xAI API key in the sidebar."
+            "Please enter your Groq API key in the sidebar."
         )
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.x.ai/v1"
+    client = Groq(
+        api_key=api_key
     )
 
     context_text = "\n\n".join(
         [
-            (
-                f"[PDF Page {item['page']}]\n"
-                f"{item['text']}"
-            )
+            f"[PDF Page {item['page']}]\n{item['text']}"
             for item in context
         ]
     )
@@ -504,19 +546,23 @@ def ask_grok(
         {
             "role": "user",
             "content": f"""
-LEGAL DOCUMENT PASSAGES:
+Here are the relevant passages retrieved from
+the Pakistan cyber law document:
+
+==================================================
 
 {context_text}
 
---------------------------------------------------
+==================================================
 
 USER QUESTION:
 
 {question}
 
---------------------------------------------------
+==================================================
 
-Answer the user's question using the legal passages above.
+Answer the user's question using the retrieved
+legal passages as your primary source.
 """
         }
     ]
@@ -524,20 +570,21 @@ Answer the user's question using the legal passages above.
     response = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        temperature=0.2
+        temperature=0.2,
+        max_tokens=2000
     )
 
     return response.choices[0].message.content
 
 
 # ============================================================
-# LOAD LEGAL DOCUMENT
+# LOAD KNOWLEDGE BASE
 # ============================================================
 
 try:
 
     with st.spinner(
-        "📚 Downloading legal document and building FAISS index..."
+        "📚 Downloading legal PDF and building FAISS knowledge base..."
     ):
 
         index, chunks = build_faiss_index()
@@ -545,7 +592,7 @@ try:
         embedding_model = load_embedding_model()
 
     st.success(
-        f"✅ Legal knowledge base ready — {len(chunks)} passages indexed."
+        f"✅ Knowledge base ready — {len(chunks)} passages indexed."
     )
 
 except Exception as e:
@@ -559,8 +606,8 @@ except Exception as e:
     )
 
     st.info(
-        "Check your Google Docs URL or set CYBER_LAW_PDF_URL "
-        "to a direct PDF URL."
+        "Make sure the Google Doc is publicly accessible "
+        "and contains the legal document."
     )
 
     st.stop()
@@ -587,7 +634,7 @@ for message in st.session_state.messages:
 
 
 # ============================================================
-# USER QUESTION
+# CHAT INPUT
 # ============================================================
 
 question = st.chat_input(
@@ -597,7 +644,6 @@ question = st.chat_input(
 
 if question:
 
-    # Display user question
     st.session_state.messages.append(
         {
             "role": "user",
@@ -624,16 +670,16 @@ if question:
             top_k
         )
 
-    # Generate answer
+    # Ask Groq
     with st.chat_message("assistant"):
 
         try:
 
             with st.spinner(
-                "🤖 Asking Grok..."
+                "🤖 Groq is generating the answer..."
             ):
 
-                answer = ask_grok(
+                answer = ask_groq(
                     question,
                     retrieved
                 )
@@ -651,13 +697,8 @@ if question:
 
         except Exception as e:
 
-            answer = (
-                "I could not generate an answer. "
-                "Please check your Grok/xAI API key and model."
-            )
-
             st.error(
-                answer
+                "❌ Groq API request failed."
             )
 
             st.code(
@@ -699,7 +740,7 @@ if question and show_sources:
 st.divider()
 
 st.caption(
-    "CyerLawGPT • RAG + FAISS + Sentence Transformers + Grok/xAI"
+    "CyerLawGPT • RAG + FAISS + Sentence Transformers + Groq"
 )
 
 st.caption(
