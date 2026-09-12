@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import io
@@ -747,4 +746,3 @@ st.caption(
     "⚠️ For educational/informational purposes only. "
     "This application does not constitute legal advice."
 )
-```
